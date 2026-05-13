@@ -7,7 +7,7 @@ Python SDK for the [Holocron](https://github.com/jedi-knights/holocron) message 
 ![Python](https://img.shields.io/badge/python-3.11+-3776AB?logo=python&logoColor=white)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-> **Status:** Pre-alpha scaffolding. The package is published as a placeholder; no client surface is implemented yet. The on-disk format, wire protocol, and public APIs of the broker change without notice until its first tagged release.
+> **Status:** Pre-alpha. The synchronous producer works against a running [Holocron broker](https://github.com/jedi-knights/holocron) at wire-protocol v10. Consumer support, batching, idempotency, compression, and TLS are not yet implemented — see the Features list below.
 
 ## Table of contents
 
@@ -33,13 +33,19 @@ For the broker itself, see the main repository. For an introduction to brokers, 
 
 What's shipped today:
 
-- Package scaffolding (`pip install holocron`)
-- Typed package (`py.typed` marker)
+- Synchronous `Producer.send` over TCP — one record per call, returns the broker-assigned offset
+- `DefaultPartitioner` — FNV-1a 32-bit of the key (Go-compatible), atomic round-robin for keyless records
+- Pluggable `Partitioner` and `Transport` protocols
+- Typed exception hierarchy mapped from broker status codes
+- Typed package (`py.typed` marker), strict mypy clean
 - CI on Python 3.11, 3.12, 3.13
 
 What's planned (tracking the broker capability matrix):
 
-- Producer with key-based partitioning, batching, and idempotent send
+- Batched producer (`PublishBatch` + linger window)
+- Idempotent producer (`HeaderProducerID` / `HeaderProducerSeq` stamping)
+- LZ4 compression
+- Rate-limit and `NotLeader` retry handling
 - Consumer with per-partition offset tracking and rewind
 - Consumer groups with range-assignment rebalancing
 - TLS and mTLS support
@@ -75,36 +81,46 @@ uv sync
 
 ## Usage
 
-The package currently exposes only its version. A real producer/consumer surface lands once the broker's wire protocol stabilises.
+Produce one record to a running broker at `localhost:9092`:
 
 ```python
-import holocron
+from holocron import Producer, Record, TcpTransport
 
-print(holocron.__version__)
+with TcpTransport.connect("localhost:9092") as transport, Producer(transport) as producer:
+    offset = producer.send("events", Record(key=b"user-42", value=b'{"action":"login"}'))
+    print(f"appended at offset {offset}")
 ```
 
-```
-0.0.1
-```
+The broker assigns the offset on append. Records with the same key always land on the same partition (FNV-1a 32-bit hash of the key, matching the Go SDK), so per-key ordering is preserved.
 
-The intended shape (subject to change) will mirror the Go SDK:
+Swap in a custom partitioner by passing any object that satisfies the `Partitioner` protocol:
 
 ```python
-# Forward-looking sketch — not yet implemented.
-from holocron import Producer, Consumer, Record
+from holocron import Partitioner, Producer, Record, TcpTransport
 
-with Producer("localhost:9092") as p:
-    p.send("events", Record(key=b"user-42", value=b'{"action":"login"}'))
+class FirstPartitionOnly:
+    def partition(self, record: Record, num_partitions: int) -> int:
+        return 0
 
-with Consumer("localhost:9092", group="audit") as c:
-    c.subscribe("events")
-    for record in c.poll(max_records=32):
-        print(record.key, record.value)
+with TcpTransport.connect("localhost:9092") as transport:
+    producer = Producer(transport, partitioner=FirstPartitionOnly())
+    producer.send("events", Record(value=b"hello"))
 ```
+
+Consumer support is not yet implemented; fetching, subscribing, and consumer groups will land in subsequent releases.
 
 ## Configuration
 
-N/A — there is no client surface yet, so there is nothing to configure. Once the producer and consumer ship, connection settings (broker address, TLS, auth tokens) will be documented here and accepted both as constructor arguments and as `HOLOCRON_*` environment variables to match the broker's convention.
+The producer takes its broker address and connection options as constructor arguments — there are no environment variables in v1.
+
+| Setting | Default | Where |
+|---|---|---|
+| Broker address | required | `TcpTransport.connect("host:port")` |
+| Dial timeout (seconds) | `5.0` | `TcpTransport.connect(..., timeout=...)` |
+| Credential | anonymous | `TcpTransport.connect(..., credential_kind=..., credential=...)` |
+| Partitioner | `DefaultPartitioner()` | `Producer(transport, partitioner=...)` |
+
+TLS, mTLS, and `HOLOCRON_*` environment-variable fallbacks land alongside the consumer in a follow-up release.
 
 ## Development
 
